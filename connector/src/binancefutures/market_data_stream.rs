@@ -24,8 +24,7 @@ use crate::{
     binancefutures::{
         BinanceFuturesError,
         msg::{
-            rest,
-            stream,
+            rest, stream,
             stream::{EventStream, Stream},
         },
         rest::BinanceFuturesClient,

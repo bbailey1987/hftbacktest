@@ -2,19 +2,12 @@ use std::collections::HashMap;
 
 use hftbacktest::{
     backtest::{
-        Backtest,
-        BacktestError,
-        DataSource,
+        Backtest, BacktestError, DataSource,
         assettype::{AssetType, LinearAsset},
         data::Reader,
         models::{
-            CommonFees,
-            ConstantLatency,
-            FeeModel,
-            LatencyModel,
-            PowerProbQueueFunc3,
-            ProbQueueModel,
-            TradingValueFeeModel,
+            CommonFees, ConstantLatency, FeeModel, LatencyModel, PowerProbQueueFunc3,
+            ProbQueueModel, TradingValueFeeModel,
         },
         order::order_bus,
         proc::{Local, LocalProcessor, NoPartialFillExchange, Processor},

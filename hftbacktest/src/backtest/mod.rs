@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
-    io::Error as IoError,
+    io::{Error as IoError, ErrorKind},
     ops::{Deref, DerefMut},
 };
 
-pub use data::DataSource;
 use data::Reader;
+pub use data::{Data, DataSource, read_npz_file};
 use models::FeeModel;
 use thiserror::Error;
 
@@ -16,7 +16,7 @@ pub use crate::backtest::{
 use crate::{
     backtest::{
         assettype::AssetType,
-        data::{Data, FeedLatencyAdjustment, NpyDTyped},
+        data::{FeedLatencyAdjustment, NpyDTyped},
         evs::{EventIntentKind, EventSet},
         models::{LatencyModel, QueueModel},
         order::order_bus,
@@ -25,16 +25,8 @@ use crate::{
     },
     depth::{L2MarketDepth, L3MarketDepth, MarketDepth},
     prelude::{
-        Bot,
-        OrdType,
-        Order,
-        OrderId,
-        OrderRequest,
-        Side,
-        StateValues,
-        TimeInForce,
-        UNTIL_END_OF_DATA,
-        WaitOrderResponse,
+        Bot, OrdType, Order, OrderId, OrderRequest, Side, StateValues, TimeInForce,
+        UNTIL_END_OF_DATA, WaitOrderResponse,
     },
     types::{BuildError, ElapseResult, Event},
 };
@@ -752,6 +744,73 @@ where
         self.goto::<false>(UNTIL_END_OF_DATA, WaitOrderResponse::None)
     }
 
+    /// Applies one externally supplied feed event to the local and exchange
+    /// processors after advancing outstanding order timers to the event time.
+    ///
+    /// This is intended for live/protocol simulation adapters that receive
+    /// market data from an external websocket instead of a static [`Reader`].
+    /// It deliberately reuses the same processors, order queues, fee model,
+    /// latency model, and market-depth logic as normal backtests; only the
+    /// feed source is external.
+    pub fn apply_external_feed_event(
+        &mut self,
+        asset_no: usize,
+        event: &Event,
+    ) -> Result<ElapseResult, BacktestError> {
+        if self.cur_ts == i64::MAX {
+            self.initialize_evs()?;
+            match self.evs.next() {
+                Some(ev) => {
+                    self.cur_ts = ev.timestamp;
+                }
+                None => {
+                    self.cur_ts = 0;
+                }
+            }
+        }
+
+        let local_ts = self
+            .local
+            .get(asset_no)
+            .and_then(|local| local.event_seen_timestamp(event));
+        let exch_ts = self
+            .exch
+            .get(asset_no)
+            .and_then(|exch| exch.event_seen_timestamp(event));
+        let Some(target_ts) = local_ts.into_iter().chain(exch_ts).max() else {
+            return Ok(ElapseResult::Ok);
+        };
+
+        let mut result = ElapseResult::Ok;
+        if target_ts > self.cur_ts {
+            result = self.goto::<false>(target_ts, WaitOrderResponse::None)?;
+        }
+
+        if let Some(ts) = local_ts {
+            if ts < self.cur_ts {
+                return Err(BacktestError::DataError(IoError::new(
+                    ErrorKind::InvalidData,
+                    "external local feed event timestamp moved backwards",
+                )));
+            }
+            let local = self.local.get_mut(asset_no).unwrap();
+            local.processor.process(event)?;
+            self.cur_ts = ts;
+        }
+        if let Some(ts) = exch_ts {
+            if ts < self.cur_ts {
+                return Err(BacktestError::DataError(IoError::new(
+                    ErrorKind::InvalidData,
+                    "external exchange feed event timestamp moved backwards",
+                )));
+            }
+            let exch = self.exch.get_mut(asset_no).unwrap();
+            exch.processor.process(event)?;
+            self.cur_ts = ts;
+        }
+        Ok(result)
+    }
+
     fn goto<const WAIT_NEXT_FEED: bool>(
         &mut self,
         timestamp: i64,
@@ -1145,17 +1204,13 @@ mod test {
 
     use crate::{
         backtest::{
-            Backtest,
-            DataSource,
+            Backtest, DataSource,
             ExchangeKind::NoPartialFillExchange,
             L2AssetBuilder,
             assettype::LinearAsset,
             data::Data,
             models::{
-                CommonFees,
-                ConstantLatency,
-                PowerProbQueueFunc3,
-                ProbQueueModel,
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
                 TradingValueFeeModel,
             },
         },

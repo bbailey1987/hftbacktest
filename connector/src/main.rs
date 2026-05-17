@@ -22,8 +22,7 @@ use iceoryx2::{
 };
 use tokio::{
     runtime::Builder,
-    select,
-    signal,
+    select, signal,
     sync::{
         Notify,
         mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},

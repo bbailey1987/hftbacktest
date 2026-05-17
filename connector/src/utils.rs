@@ -14,9 +14,7 @@ use hftbacktest::prelude::OrderId;
 use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{
-    Deserialize,
-    Deserializer,
-    de,
+    Deserialize, Deserializer, de,
     de::{Error, Visitor},
 };
 use sha2::Sha256;

@@ -21,8 +21,7 @@ use tracing::{debug, error, warn};
 
 use crate::{
     binancefutures::{
-        BinanceFuturesError,
-        SharedSymbolSet,
+        BinanceFuturesError, SharedSymbolSet,
         msg::stream::{EventStream, Stream},
         ordermanager::SharedOrderManager,
         rest::BinanceFuturesClient,

@@ -6,8 +6,8 @@ use std::{
     mem::size_of,
     ops::{Index, IndexMut},
     ptr::null_mut,
-    rc::Rc,
     slice::SliceIndex,
+    sync::Arc,
 };
 
 pub use npy::{Field, NpyDTyped, NpyHeader, read_npy_file, read_npz_file, write_npy};
@@ -28,7 +28,7 @@ pub struct Data<D>
 where
     D: POD + Clone,
 {
-    ptr: Rc<DataPtr>,
+    ptr: Arc<DataPtr>,
     offset: usize,
     _d_marker: PhantomData<D>,
 }
@@ -80,7 +80,7 @@ where
     /// offset.
     pub unsafe fn from_data_ptr(ptr: DataPtr, offset: usize) -> Self {
         Self {
-            ptr: Rc::new(ptr),
+            ptr: Arc::new(ptr),
             offset,
             _d_marker: PhantomData,
         }
@@ -100,7 +100,25 @@ where
 
     /// Returns `true` if the two `Data` point to the same data.
     pub fn data_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.ptr, &other.ptr)
+        Arc::ptr_eq(&self.ptr, &other.ptr)
+    }
+
+    /// Returns a new `Data` that shares the same underlying buffer but starts at `start_idx`.
+    /// This is O(1) — no data is copied.
+    ///
+    /// # Panics
+    /// Panics if `start_idx > self.len()`.
+    pub fn slice_from(&self, start_idx: usize) -> Self {
+        let size = size_of::<D>();
+        assert!(
+            start_idx <= self.len(),
+            "slice_from: start_idx out of bounds"
+        );
+        Self {
+            ptr: Arc::clone(&self.ptr),
+            offset: self.offset + start_idx * size,
+            _d_marker: PhantomData,
+        }
     }
 }
 
@@ -214,6 +232,15 @@ where
         &mut arr[index]
     }
 }
+
+// SAFETY: DataPtr owns its memory when managed=true (via AlignedArray allocation).
+// The raw pointer is only accessed immutably through shared references (&Data),
+// and mutably only through exclusive references (&mut Data). Arc ensures the
+// underlying memory is freed only when no references remain. Callers using
+// from_ptr (managed=false) must ensure the pointer remains valid for the
+// lifetime of all Data clones — the same invariant as before with Rc.
+unsafe impl Send for DataPtr {}
+unsafe impl Sync for DataPtr {}
 
 impl Drop for DataPtr {
     fn drop(&mut self) {
