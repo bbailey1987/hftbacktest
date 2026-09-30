@@ -86,8 +86,36 @@ where
             }
 
             // Processes receiving order response.
-            if order.status == Status::Filled {
-                self.state.apply_fill(&order);
+            //
+            // AB#3112 (gentilly): book every execution the response newly reports,
+            // not only a final `Filled` snapshot. The exchange reports each fill
+            // (every level of a taker book walk included) in its own response
+            // carrying that fill's exec price; the quantity new to this response is
+            // the drop in `leaves_qty` since the local copy last heard from the
+            // exchange. Applying only `Filled` responses with their last-fill
+            // `exec_qty` dropped every earlier level of a multi-level walk and every
+            // partial fill of an IOC that then expired. A response that changes the
+            // order quantity (modify) or has no local copy keeps the legacy rule.
+            let prev_leaves = match self.orders.get(&order.order_id) {
+                Some(local) if order.req != Status::Rejected && local.qty == order.qty => {
+                    Some(local.leaves_qty)
+                }
+                _ => None,
+            };
+            match prev_leaves {
+                Some(prev_leaves) => {
+                    let executed = prev_leaves - order.leaves_qty;
+                    if executed > order.qty * 1e-9 {
+                        let mut fill = order.clone();
+                        fill.exec_qty = executed;
+                        self.state.apply_fill(&fill);
+                    }
+                }
+                None => {
+                    if order.status == Status::Filled {
+                        self.state.apply_fill(&order);
+                    }
+                }
             }
             // Applies the received order response to the local orders.
             match self.orders.entry(order.order_id) {

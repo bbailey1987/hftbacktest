@@ -134,6 +134,7 @@ pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     last_trades_cap: usize,
     queue_model: Option<QM>,
     depth_builder: Option<Box<dyn Fn() -> MD>>,
+    own_fill_depletion: bool,
 }
 
 impl<LM, AT, QM, MD, FM> L2AssetBuilder<LM, AT, QM, MD, FM>
@@ -157,6 +158,7 @@ where
             last_trades_cap: 0,
             queue_model: None,
             depth_builder: None,
+            own_fill_depletion: false,
         }
     }
 
@@ -242,6 +244,16 @@ where
         }
     }
 
+    /// Sets whether the [`PartialFillExchange`] depletes displayed depth by our own taker fills until the feed
+    /// next updates that price level. Replayed depth never reflects our own fills, so without depletion a later
+    /// taker order can fill again against shares an earlier one already took. The default value is `false`.
+    pub fn own_fill_depletion(self, own_fill_depletion: bool) -> Self {
+        Self {
+            own_fill_depletion,
+            ..self
+        }
+    }
+
     /// Builds an `Asset`.
     pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor, Event>, BuildError> {
         let reader = if self.latency_offset == 0 {
@@ -318,7 +330,8 @@ where
                     State::new(asset_type, fee_model),
                     queue_model,
                     order_e2l,
-                );
+                )
+                .with_own_fill_depletion(self.own_fill_depletion);
 
                 Ok(Asset {
                     local: Box::new(local),

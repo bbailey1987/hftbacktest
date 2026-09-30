@@ -84,6 +84,13 @@ where
     queue_model: QM,
 
     filled_orders: Vec<OrderId>,
+
+    // Own-fill depletion (opt-in): the quantity our own taker fills took at each price level since that level's
+    // last feed update. Replayed depth never reflects our own fills, so without it a later taker order can fill
+    // again against displayed shares one of ours already took.
+    own_fill_depletion: bool,
+    consumed_bid: HashMap<i64, f64>,
+    consumed_ask: HashMap<i64, f64>,
 }
 
 impl<AT, LM, QM, MD, FM> PartialFillExchange<AT, LM, QM, MD, FM>
@@ -110,7 +117,17 @@ where
             state,
             queue_model,
             filled_orders: Default::default(),
+            own_fill_depletion: false,
+            consumed_bid: Default::default(),
+            consumed_ask: Default::default(),
         }
+    }
+
+    /// Opt-in own-fill depletion: a taker order cannot fill against displayed quantity that our own earlier taker
+    /// fills already took at that price level, until the feed next updates the level.
+    pub fn with_own_fill_depletion(mut self, enabled: bool) -> Self {
+        self.own_fill_depletion = enabled;
+        self
     }
 
     fn check_if_sell_filled(
@@ -372,6 +389,9 @@ where
         Ok(())
     }
 
+    // AB#3112 (gentilly): every level a taker walks is reported in its own
+    // response (`fill::<true>`), so the local processor can book each fill at
+    // its own price; the final ack response then reports no new execution.
     fn ack_new(&mut self, order: &mut Order, timestamp: i64) -> Result<(), BacktestError> {
         if self.orders.borrow().contains_key(&order.order_id) {
             return Err(BacktestError::OrderIdExist);
@@ -407,7 +427,7 @@ where
                                         let qty = self.depth.ask_qty_at_tick(t);
                                         if qty > 0.0 {
                                             let exec_qty = qty.min(order.leaves_qty);
-                                            self.fill::<false>(
+                                            self.fill::<true>(
                                                 order, timestamp, false, t, exec_qty,
                                             )?;
                                             if order.status == Status::Filled {
@@ -425,10 +445,16 @@ where
                             TimeInForce::IOC => {
                                 // The order must be executed immediately.
                                 for t in self.depth.best_ask_tick()..=order.price_tick {
-                                    let qty = self.depth.ask_qty_at_tick(t);
+                                    let mut qty = self.depth.ask_qty_at_tick(t);
+                                    if self.own_fill_depletion {
+                                        qty -= self.consumed_ask.get(&t).copied().unwrap_or(0.0);
+                                    }
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        if self.own_fill_depletion {
+                                            *self.consumed_ask.entry(t).or_insert(0.0) += exec_qty;
+                                        }
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -444,7 +470,7 @@ where
                                     let qty = self.depth.ask_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -456,7 +482,7 @@ where
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
                                 let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
-                                self.fill::<false>(order, timestamp, false, price_tick, leaves_qty)
+                                self.fill::<true>(order, timestamp, false, price_tick, leaves_qty)
                             }
                             TimeInForce::Unsupported => Err(BacktestError::InvalidOrderRequest),
                         }
@@ -493,7 +519,7 @@ where
                         let qty = self.depth.ask_qty_at_tick(t);
                         if qty > 0.0 {
                             let exec_qty = qty.min(order.leaves_qty);
-                            self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                            self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
                             return Ok(());
@@ -535,7 +561,7 @@ where
                                         let qty = self.depth.bid_qty_at_tick(t);
                                         if qty > 0.0 {
                                             let exec_qty = qty.min(order.leaves_qty);
-                                            self.fill::<false>(
+                                            self.fill::<true>(
                                                 order, timestamp, false, t, exec_qty,
                                             )?;
                                             if order.status == Status::Filled {
@@ -553,10 +579,16 @@ where
                             TimeInForce::IOC => {
                                 // The order must be executed immediately.
                                 for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
-                                    let qty = self.depth.bid_qty_at_tick(t);
+                                    let mut qty = self.depth.bid_qty_at_tick(t);
+                                    if self.own_fill_depletion {
+                                        qty -= self.consumed_bid.get(&t).copied().unwrap_or(0.0);
+                                    }
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        if self.own_fill_depletion {
+                                            *self.consumed_bid.entry(t).or_insert(0.0) += exec_qty;
+                                        }
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -572,7 +604,7 @@ where
                                     let qty = self.depth.bid_qty_at_tick(t);
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
-                                        self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                                        self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                                     }
                                     if order.status == Status::Filled {
                                         return Ok(());
@@ -584,7 +616,7 @@ where
                                 // though it simulates partial fill, if the order size is not small enough,
                                 // it introduces unreality.
                                 let (price_tick, leaves_qty) = (order.price_tick, order.leaves_qty);
-                                self.fill::<false>(order, timestamp, false, price_tick, leaves_qty)
+                                self.fill::<true>(order, timestamp, false, price_tick, leaves_qty)
                             }
                             _ => {
                                 unreachable!();
@@ -624,7 +656,7 @@ where
                         let qty = self.depth.bid_qty_at_tick(t);
                         if qty > 0.0 {
                             let exec_qty = qty.min(order.leaves_qty);
-                            self.fill::<false>(order, timestamp, false, t, exec_qty)?;
+                            self.fill::<true>(order, timestamp, false, t, exec_qty)?;
                         }
                         if order.status == Status::Filled {
                             return Ok(());
@@ -735,14 +767,19 @@ where
     fn process(&mut self, event: &Event) -> Result<(), BacktestError> {
         if event.is(EXCH_BID_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Buy, event.px);
+            self.consumed_bid.clear();
         } else if event.is(EXCH_ASK_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::Sell, event.px);
+            self.consumed_ask.clear();
         } else if event.is(EXCH_DEPTH_CLEAR_EVENT) {
             self.depth.clear_depth(Side::None, 0.0);
+            self.consumed_bid.clear();
+            self.consumed_ask.clear();
         } else if event.is(EXCH_BID_DEPTH_EVENT) || event.is(EXCH_BID_DEPTH_SNAPSHOT_EVENT) {
             let (price_tick, prev_best_bid_tick, best_bid_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_bid_depth(event.px, event.qty, event.exch_ts);
+            self.consumed_bid.remove(&price_tick);
             self.on_bid_qty_chg(price_tick, prev_qty, new_qty);
             if best_bid_tick > prev_best_bid_tick {
                 self.on_best_bid_update(prev_best_bid_tick, best_bid_tick, timestamp)?;
@@ -751,6 +788,7 @@ where
             let (price_tick, prev_best_ask_tick, best_ask_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_ask_depth(event.px, event.qty, event.exch_ts);
+            self.consumed_ask.remove(&price_tick);
             self.on_ask_qty_chg(price_tick, prev_qty, new_qty);
             if best_ask_tick < prev_best_ask_tick {
                 self.on_best_ask_update(prev_best_ask_tick, best_ask_tick, timestamp)?;
