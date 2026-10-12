@@ -135,6 +135,7 @@ pub struct L2AssetBuilder<LM, AT, QM, MD, FM> {
     queue_model: Option<QM>,
     depth_builder: Option<Box<dyn Fn() -> MD>>,
     own_fill_depletion: bool,
+    own_fill_depletion_persists: bool,
 }
 
 impl<LM, AT, QM, MD, FM> L2AssetBuilder<LM, AT, QM, MD, FM>
@@ -159,6 +160,7 @@ where
             queue_model: None,
             depth_builder: None,
             own_fill_depletion: false,
+            own_fill_depletion_persists: false,
         }
     }
 
@@ -254,6 +256,16 @@ where
         }
     }
 
+    /// With own-fill depletion enabled, sets whether what our own taker fills took from a price level stays taken
+    /// across feed updates of that level, until the feed empties it, instead of being forgotten at the level's next
+    /// update. The default value is `false`.
+    pub fn own_fill_depletion_persists(self, own_fill_depletion_persists: bool) -> Self {
+        Self {
+            own_fill_depletion_persists,
+            ..self
+        }
+    }
+
     /// Builds an `Asset`.
     pub fn build(self) -> Result<Asset<dyn LocalProcessor<MD>, dyn Processor, Event>, BuildError> {
         let reader = if self.latency_offset == 0 {
@@ -331,7 +343,8 @@ where
                     queue_model,
                     order_e2l,
                 )
-                .with_own_fill_depletion(self.own_fill_depletion);
+                .with_own_fill_depletion(self.own_fill_depletion)
+                .with_own_fill_depletion_persists(self.own_fill_depletion_persists);
 
                 Ok(Asset {
                     local: Box::new(local),

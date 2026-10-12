@@ -24,6 +24,24 @@ use crate::{
     },
 };
 
+/// Applies a feed update of one price level to what our own taker fills took from it. Without `persists` the feed
+/// update makes the level whole again. With it, what we took stays taken, capped at the quantity the level now
+/// displays, until the feed empties the level.
+fn own_fills_after_level_update(
+    consumed: &mut HashMap<i64, f64>,
+    persists: bool,
+    price_tick: i64,
+    new_qty: f64,
+) {
+    if !persists || new_qty <= 0.0 {
+        consumed.remove(&price_tick);
+    } else if let Some(taken) = consumed.get_mut(&price_tick) {
+        if *taken > new_qty {
+            *taken = new_qty;
+        }
+    }
+}
+
 /// The exchange model with partial fills.
 ///
 /// * Support order types: [OrdType::Limit](crate::types::OrdType::Limit)
@@ -89,6 +107,9 @@ where
     // last feed update. Replayed depth never reflects our own fills, so without it a later taker order can fill
     // again against displayed shares one of ours already took.
     own_fill_depletion: bool,
+    // With own-fill depletion: `false` (the default) forgets what we took from a level when the feed next updates
+    // that level; `true` keeps it across feed updates until the feed empties the level.
+    own_fill_depletion_persists: bool,
     consumed_bid: HashMap<i64, f64>,
     consumed_ask: HashMap<i64, f64>,
 }
@@ -118,6 +139,7 @@ where
             queue_model,
             filled_orders: Default::default(),
             own_fill_depletion: false,
+            own_fill_depletion_persists: false,
             consumed_bid: Default::default(),
             consumed_ask: Default::default(),
         }
@@ -127,6 +149,16 @@ where
     /// fills already took at that price level, until the feed next updates the level.
     pub fn with_own_fill_depletion(mut self, enabled: bool) -> Self {
         self.own_fill_depletion = enabled;
+        self
+    }
+
+    /// With own-fill depletion enabled, what our own taker fills took from a price level stays taken across feed
+    /// updates of that level instead of being forgotten at the next one. An update that leaves less than we took
+    /// caps what we took at the new displayed quantity, quantity displayed beyond what we took is available, and a
+    /// level the feed empties starts fresh. This is the conservative bound: it assumes a feed update never
+    /// replaces what we took, where the default assumes it always does.
+    pub fn with_own_fill_depletion_persists(mut self, enabled: bool) -> Self {
+        self.own_fill_depletion_persists = enabled;
         self
     }
 
@@ -779,7 +811,12 @@ where
             let (price_tick, prev_best_bid_tick, best_bid_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_bid_depth(event.px, event.qty, event.exch_ts);
-            self.consumed_bid.remove(&price_tick);
+            own_fills_after_level_update(
+                &mut self.consumed_bid,
+                self.own_fill_depletion_persists,
+                price_tick,
+                new_qty,
+            );
             self.on_bid_qty_chg(price_tick, prev_qty, new_qty);
             if best_bid_tick > prev_best_bid_tick {
                 self.on_best_bid_update(prev_best_bid_tick, best_bid_tick, timestamp)?;
@@ -788,7 +825,12 @@ where
             let (price_tick, prev_best_ask_tick, best_ask_tick, prev_qty, new_qty, timestamp) =
                 self.depth
                     .update_ask_depth(event.px, event.qty, event.exch_ts);
-            self.consumed_ask.remove(&price_tick);
+            own_fills_after_level_update(
+                &mut self.consumed_ask,
+                self.own_fill_depletion_persists,
+                price_tick,
+                new_qty,
+            );
             self.on_ask_qty_chg(price_tick, prev_qty, new_qty);
             if best_ask_tick < prev_best_ask_tick {
                 self.on_best_ask_update(prev_best_ask_tick, best_ask_tick, timestamp)?;
@@ -889,5 +931,50 @@ where
         self.order_e2l
             .earliest_send_order_timestamp()
             .unwrap_or(i64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod own_fill_depletion_tests {
+    use std::collections::HashMap;
+
+    use super::own_fills_after_level_update;
+
+    fn taken(qty: f64) -> HashMap<i64, f64> {
+        HashMap::from([(834_124, qty)])
+    }
+
+    #[test]
+    fn a_feed_update_makes_the_level_whole_by_default() {
+        let mut consumed = taken(0.03);
+        own_fills_after_level_update(&mut consumed, false, 834_124, 0.045);
+        assert!(consumed.is_empty());
+    }
+
+    #[test]
+    fn persisting_keeps_what_we_took_across_a_feed_update() {
+        let mut consumed = taken(0.03);
+        own_fills_after_level_update(&mut consumed, true, 834_124, 0.045);
+        assert_eq!(consumed[&834_124], 0.03);
+        // Another level's update leaves it alone.
+        own_fills_after_level_update(&mut consumed, true, 834_125, 0.0);
+        assert_eq!(consumed[&834_124], 0.03);
+    }
+
+    #[test]
+    fn persisting_caps_what_we_took_at_the_displayed_quantity() {
+        let mut consumed = taken(0.03);
+        own_fills_after_level_update(&mut consumed, true, 834_124, 0.01);
+        assert_eq!(consumed[&834_124], 0.01);
+        // Quantity added afterwards is available beyond what we took.
+        own_fills_after_level_update(&mut consumed, true, 834_124, 0.05);
+        assert_eq!(consumed[&834_124], 0.01);
+    }
+
+    #[test]
+    fn persisting_starts_fresh_once_the_feed_empties_the_level() {
+        let mut consumed = taken(0.03);
+        own_fills_after_level_update(&mut consumed, true, 834_124, 0.0);
+        assert!(consumed.is_empty());
     }
 }
