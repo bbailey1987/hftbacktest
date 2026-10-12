@@ -246,9 +246,10 @@ where
         }
     }
 
-    /// Sets whether the [`PartialFillExchange`] depletes displayed depth by our own taker fills until the feed
-    /// next updates that price level. Replayed depth never reflects our own fills, so without depletion a later
-    /// taker order can fill again against shares an earlier one already took. The default value is `false`.
+    /// Sets whether the [`PartialFillExchange`] depletes displayed depth by our own IOC taker fills until the feed
+    /// next updates that price level (see [`Self::own_fill_depletion_persists`] for the rule that keeps it longer).
+    /// Replayed depth never reflects our own fills, so without depletion a later taker order can fill again against
+    /// shares an earlier one already took. The default value is `false`.
     pub fn own_fill_depletion(self, own_fill_depletion: bool) -> Self {
         Self {
             own_fill_depletion,
@@ -256,9 +257,9 @@ where
         }
     }
 
-    /// With own-fill depletion enabled, sets whether what our own taker fills took from a price level stays taken
-    /// across feed updates of that level, until the feed empties it, instead of being forgotten at the level's next
-    /// update. The default value is `false`.
+    /// With own-fill depletion enabled, sets whether what our own IOC taker fills took from a price level stays
+    /// taken across feed updates of that level, until the level is empty, instead of being forgotten at the level's
+    /// next update. A depth clear event still forgets the whole side. The default value is `false`.
     pub fn own_fill_depletion_persists(self, own_fill_depletion_persists: bool) -> Self {
         Self {
             own_fill_depletion_persists,

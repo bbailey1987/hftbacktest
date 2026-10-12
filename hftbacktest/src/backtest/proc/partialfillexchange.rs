@@ -24,21 +24,34 @@ use crate::{
     },
 };
 
-/// Applies a feed update of one price level to what our own taker fills took from it. Without `persists` the feed
-/// update makes the level whole again. With it, what we took stays taken, capped at the quantity the level now
-/// displays, until the feed empties the level.
+/// Applies a feed update of one price level to what our own taker fills took from it. `level_qty` is the quantity
+/// the depth holds at the level after the update (zero once the depth has dropped the level). Without `persists`
+/// the feed update makes the level whole again. With it, what we took stays taken, capped at the quantity the level
+/// now holds, until the level is empty.
 fn own_fills_after_level_update(
     consumed: &mut HashMap<i64, f64>,
     persists: bool,
     price_tick: i64,
-    new_qty: f64,
+    level_qty: f64,
 ) {
-    if !persists || new_qty <= 0.0 {
+    if !persists || level_qty <= 0.0 {
         consumed.remove(&price_tick);
     } else if let Some(taken) = consumed.get_mut(&price_tick) {
-        if *taken > new_qty {
-            *taken = new_qty;
+        if *taken > level_qty {
+            *taken = level_qty;
         }
+    }
+}
+
+/// The quantity of a level a taker order can still fill against, given what our own fills took from it. With
+/// persisting depletion a level can stay fully taken across many orders, so a remainder below half a lot, which is
+/// only the rounding left by adding our fills up, is nothing rather than a fill of that size.
+fn own_fill_available(level_qty: f64, taken: f64, persists: bool, lot_size: f64) -> f64 {
+    let available = level_qty - taken;
+    if persists && available < 0.5 * lot_size {
+        0.0
+    } else {
+        available
     }
 }
 
@@ -103,9 +116,10 @@ where
 
     filled_orders: Vec<OrderId>,
 
-    // Own-fill depletion (opt-in): the quantity our own taker fills took at each price level since that level's
-    // last feed update. Replayed depth never reflects our own fills, so without it a later taker order can fill
-    // again against displayed shares one of ours already took.
+    // Own-fill depletion (opt-in): the quantity our own IOC taker fills took at each price level, since that level's
+    // last feed update or, with `own_fill_depletion_persists`, since the level was last empty. Replayed depth never
+    // reflects our own fills, so without it a later taker order can fill again against displayed shares one of
+    // ours already took. A depth clear event forgets the whole side.
     own_fill_depletion: bool,
     // With own-fill depletion: `false` (the default) forgets what we took from a level when the feed next updates
     // that level; `true` keeps it across feed updates until the feed empties the level.
@@ -145,18 +159,20 @@ where
         }
     }
 
-    /// Opt-in own-fill depletion: a taker order cannot fill against displayed quantity that our own earlier taker
-    /// fills already took at that price level, until the feed next updates the level.
+    /// Opt-in own-fill depletion: an IOC taker order cannot fill against displayed quantity that our own earlier IOC
+    /// taker fills already took at that price level, until the feed next updates the level (or, with
+    /// [`Self::with_own_fill_depletion_persists`], until the level is empty).
     pub fn with_own_fill_depletion(mut self, enabled: bool) -> Self {
         self.own_fill_depletion = enabled;
         self
     }
 
-    /// With own-fill depletion enabled, what our own taker fills took from a price level stays taken across feed
+    /// With own-fill depletion enabled, what our own IOC taker fills took from a price level stays taken across feed
     /// updates of that level instead of being forgotten at the next one. An update that leaves less than we took
     /// caps what we took at the new displayed quantity, quantity displayed beyond what we took is available, and a
-    /// level the feed empties starts fresh. This is the conservative bound: it assumes a feed update never
-    /// replaces what we took, where the default assumes it always does.
+    /// level the feed empties starts fresh. Across level updates this is the conservative bound: it assumes an
+    /// update never replaces what we took, where the default assumes it always does. A depth clear event still
+    /// forgets the whole side, and only IOC orders read or add to what was taken.
     pub fn with_own_fill_depletion_persists(mut self, enabled: bool) -> Self {
         self.own_fill_depletion_persists = enabled;
         self
@@ -479,7 +495,12 @@ where
                                 for t in self.depth.best_ask_tick()..=order.price_tick {
                                     let mut qty = self.depth.ask_qty_at_tick(t);
                                     if self.own_fill_depletion {
-                                        qty -= self.consumed_ask.get(&t).copied().unwrap_or(0.0);
+                                        qty = own_fill_available(
+                                            qty,
+                                            self.consumed_ask.get(&t).copied().unwrap_or(0.0),
+                                            self.own_fill_depletion_persists,
+                                            self.depth.lot_size(),
+                                        );
                                     }
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
@@ -613,7 +634,12 @@ where
                                 for t in (order.price_tick..=self.depth.best_bid_tick()).rev() {
                                     let mut qty = self.depth.bid_qty_at_tick(t);
                                     if self.own_fill_depletion {
-                                        qty -= self.consumed_bid.get(&t).copied().unwrap_or(0.0);
+                                        qty = own_fill_available(
+                                            qty,
+                                            self.consumed_bid.get(&t).copied().unwrap_or(0.0),
+                                            self.own_fill_depletion_persists,
+                                            self.depth.lot_size(),
+                                        );
                                     }
                                     if qty > 0.0 {
                                         let exec_qty = qty.min(order.leaves_qty);
@@ -815,7 +841,7 @@ where
                 &mut self.consumed_bid,
                 self.own_fill_depletion_persists,
                 price_tick,
-                new_qty,
+                self.depth.bid_qty_at_tick(price_tick),
             );
             self.on_bid_qty_chg(price_tick, prev_qty, new_qty);
             if best_bid_tick > prev_best_bid_tick {
@@ -829,7 +855,7 @@ where
                 &mut self.consumed_ask,
                 self.own_fill_depletion_persists,
                 price_tick,
-                new_qty,
+                self.depth.ask_qty_at_tick(price_tick),
             );
             self.on_ask_qty_chg(price_tick, prev_qty, new_qty);
             if best_ask_tick < prev_best_ask_tick {
@@ -938,7 +964,7 @@ where
 mod own_fill_depletion_tests {
     use std::collections::HashMap;
 
-    use super::own_fills_after_level_update;
+    use super::{own_fill_available, own_fills_after_level_update};
 
     fn taken(qty: f64) -> HashMap<i64, f64> {
         HashMap::from([(834_124, qty)])
@@ -969,6 +995,24 @@ mod own_fill_depletion_tests {
         // Quantity added afterwards is available beyond what we took.
         own_fills_after_level_update(&mut consumed, true, 834_124, 0.05);
         assert_eq!(consumed[&834_124], 0.01);
+    }
+
+    #[test]
+    fn a_fully_taken_level_offers_nothing_whatever_rounding_the_fills_left() {
+        // 3.06427 displayed; fills of 0.94783 and of the rest add up to one unit in the last place short of it.
+        let (displayed, first) = (3.06427_f64, 0.94783_f64);
+        let taken = first + (displayed - first);
+        assert!(
+            displayed - taken > 0.0,
+            "the case must leave a positive remainder"
+        );
+        assert_eq!(own_fill_available(displayed, taken, true, 0.00001), 0.0);
+        // A real remainder is available in full, and the default rule is the plain difference.
+        assert_eq!(own_fill_available(1.0, 0.6, true, 0.00001), 1.0 - 0.6);
+        assert_eq!(
+            own_fill_available(displayed, taken, false, 0.00001),
+            displayed - taken
+        );
     }
 
     #[test]
