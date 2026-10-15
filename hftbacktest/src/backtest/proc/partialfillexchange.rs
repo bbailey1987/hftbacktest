@@ -2,6 +2,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     collections::{HashMap, HashSet},
+    num::NonZeroU64,
     rc::Rc,
 };
 
@@ -23,6 +24,60 @@ use crate::{
         Order, OrderId, Side, Status, TimeInForce,
     },
 };
+
+/// Identity of a submitted batch, independent of timestamps. Created by its registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IocBatchId(NonZeroU64);
+
+#[derive(Default, Debug)]
+struct IocBatchRegistryState {
+    next_batch: u64,
+    orders: HashMap<OrderId, IocBatchId>,
+}
+
+/// Shared only with the submitting thread of one exchange. Register accepted IOC
+/// orders before advancing its clock. The order bus must deliver batches in
+/// submission order, with each batch contiguous. Entries are removed at arrival.
+#[derive(Clone, Default, Debug)]
+pub struct IocBatchRegistry(Rc<RefCell<IocBatchRegistryState>>);
+
+/// An order cannot belong to two in-flight batches.
+#[derive(Debug)]
+pub struct DuplicateIocBatchOrder(pub OrderId);
+
+impl IocBatchRegistry {
+    pub fn begin_batch(&self) -> IocBatchId {
+        let mut state = self.0.borrow_mut();
+        state.next_batch = state
+            .next_batch
+            .checked_add(1)
+            .expect("IOC submitted batch identity must not overflow");
+        IocBatchId(
+            NonZeroU64::new(state.next_batch).expect("IOC submitted batch identity starts at one"),
+        )
+    }
+
+    pub fn register_order(
+        &self,
+        order_id: OrderId,
+        batch: IocBatchId,
+    ) -> Result<(), DuplicateIocBatchOrder> {
+        use std::collections::hash_map::Entry;
+        match self.0.borrow_mut().orders.entry(order_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(batch);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(DuplicateIocBatchOrder(order_id)),
+        }
+    }
+
+    fn receive(&self, order_id: OrderId) -> IocBatchId {
+        self.0.borrow_mut().orders.remove(&order_id).expect(
+            "every accepted IOC must have its submitted batch registered before exchange arrival",
+        )
+    }
+}
 
 /// Applies a feed update of one price level to what our own taker fills took from it. `level_qty` is the quantity
 /// the depth holds at the level after the update (zero once the depth has dropped the level). Without `persists`
@@ -124,6 +179,8 @@ where
     // With own-fill depletion: `false` (the default) forgets what we took from a level when the feed next updates
     // that level; `true` keeps it across feed updates until the feed empties the level.
     own_fill_depletion_persists: bool,
+    ioc_batches: Option<IocBatchRegistry>,
+    active_ioc_batch: Option<IocBatchId>,
     consumed_bid: HashMap<i64, f64>,
     consumed_ask: HashMap<i64, f64>,
 }
@@ -154,6 +211,8 @@ where
             filled_orders: Default::default(),
             own_fill_depletion: false,
             own_fill_depletion_persists: false,
+            ioc_batches: None,
+            active_ioc_batch: None,
             consumed_bid: Default::default(),
             consumed_ask: Default::default(),
         }
@@ -163,6 +222,10 @@ where
     /// taker fills already took at that price level, until the feed next updates the level (or, with
     /// [`Self::with_own_fill_depletion_persists`], until the level is empty).
     pub fn with_own_fill_depletion(mut self, enabled: bool) -> Self {
+        self.ioc_batches
+            .is_none()
+            .then_some(())
+            .expect("submitted-batch matching cannot disable its shared liquidity budget");
         self.own_fill_depletion = enabled;
         self
     }
@@ -174,7 +237,20 @@ where
     /// update never replaces what we took, where the default assumes it always does. A depth clear event still
     /// forgets the whole side, and only IOC orders read or add to what was taken.
     pub fn with_own_fill_depletion_persists(mut self, enabled: bool) -> Self {
+        self.ioc_batches.is_none().then_some(())
+            .expect("submitted-batch matching cannot retain deductions between batches or level replacements");
         self.own_fill_depletion_persists = enabled;
+        self
+    }
+
+    /// Mandatory shared liquidity within each explicit submitted IOC batch, with
+    /// no deduction carried into the next batch. Clear at exchange arrival, not
+    /// registration, so several batches may be in flight during entry latency.
+    /// Authoritative feed updates still replace level quantity normally.
+    pub fn with_ioc_batches(mut self, batches: IocBatchRegistry) -> Self {
+        self.ioc_batches = Some(batches);
+        self.own_fill_depletion = true;
+        self.own_fill_depletion_persists = false;
         self
     }
 
@@ -926,6 +1002,19 @@ where
         while let Some(mut order) = self.order_e2l.receive(timestamp) {
             // Processes a new order.
             if order.req == Status::New {
+                if order.time_in_force == TimeInForce::IOC {
+                    if let Some(batches) = &self.ioc_batches {
+                        let batch = batches.receive(order.order_id);
+                        self.active_ioc_batch.is_none_or(|active| batch >= active)
+                            .then_some(())
+                            .expect("IOC order bus must deliver submitted batches contiguously in submission order");
+                        if self.active_ioc_batch != Some(batch) {
+                            self.consumed_bid.clear();
+                            self.consumed_ask.clear();
+                            self.active_ioc_batch = Some(batch);
+                        }
+                    }
+                }
                 order.req = Status::None;
                 self.ack_new(&mut order, timestamp)?;
             }
@@ -965,6 +1054,26 @@ mod own_fill_depletion_tests {
     use std::collections::HashMap;
 
     use super::{own_fill_available, own_fills_after_level_update};
+
+    #[test]
+    fn submitted_batches_have_distinct_identity_and_release_registration_at_arrival() {
+        let batches = super::IocBatchRegistry::default();
+        let first = batches.begin_batch();
+        let second = batches.begin_batch();
+        assert!(second > first);
+        batches.register_order(42, first).unwrap();
+        assert!(batches.register_order(42, second).is_err());
+        assert_eq!(batches.receive(42), first);
+        assert!(batches.0.borrow().orders.is_empty());
+        batches.register_order(42, second).unwrap();
+        assert_eq!(batches.receive(42), second);
+    }
+
+    #[test]
+    #[should_panic(expected = "every accepted IOC must have its submitted batch registered")]
+    fn unregistered_ioc_stops_at_exchange_arrival() {
+        super::IocBatchRegistry::default().receive(42);
+    }
 
     fn taken(qty: f64) -> HashMap<i64, f64> {
         HashMap::from([(834_124, qty)])

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 
 pub use local::Local;
 pub use nopartialfillexchange::NoPartialFillExchange;
-pub use partialfillexchange::PartialFillExchange;
+pub use partialfillexchange::{
+    DuplicateIocBatchOrder, IocBatchId, IocBatchRegistry, PartialFillExchange,
+};
 
 mod l3_local;
 
