@@ -96,9 +96,18 @@ where
             // `exec_qty` dropped every earlier level of a multi-level walk and every
             // partial fill of an IOC that then expired. A response that changes the
             // order quantity (modify) or has no local copy keeps the legacy rule.
+            // AB#3465 (gentilly): a modify sets the local copy's `qty` at request time but keeps its
+            // old `leaves_qty`, and the exchange's acknowledgement returns either remainder depending on
+            // its path. Measured against the stale local remainder, a size change was booked as an
+            // execution at `exec_price_tick` 0 (position moved, balance did not). The acknowledgement
+            // of a pending modify (returned as `New`) carries no execution.
             let prev_leaves = match self.orders.get(&order.order_id) {
                 Some(local) if order.req != Status::Rejected && local.qty == order.qty => {
-                    Some(local.leaves_qty)
+                    if local.req == Status::Replaced && order.status == Status::New {
+                        Some(order.leaves_qty)
+                    } else {
+                        Some(local.leaves_qty)
+                    }
                 }
                 _ => None,
             };
