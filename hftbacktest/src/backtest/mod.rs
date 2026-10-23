@@ -1342,3 +1342,74 @@ mod ab3308_maker_terminal {
         }
     }
 }
+
+#[cfg(test)]
+mod ab3465_modify_is_not_an_execution {
+    use crate::{
+        backtest::{
+            Backtest,
+            DataSource,
+            ExchangeKind,
+            L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees,
+                ConstantLatency,
+                PowerProbQueueFunc3,
+                ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
+
+    #[test]
+    fn reducing_a_resting_maker_order_books_no_fill() {
+        for buy in [true, false] {
+            let event = |t, ev, px, qty| Event {
+                ev: ev | EXCH_EVENT | LOCAL_EVENT,
+                exch_ts: t,
+                local_ts: t,
+                px,
+                qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            };
+            let price = if buy { 99.0 } else { 101.0 };
+            let data = Data::from_data(&[
+                event(1, DEPTH_EVENT | BUY_EVENT, 99.0, 1.0),
+                event(2, DEPTH_EVENT | SELL_EVENT, 101.0, 1.0),
+                event(3, 0, 0.0, 0.0),
+                event(30, 0, 0.0, 0.0),
+            ]);
+            let asset = L2AssetBuilder::default()
+                .data(vec![DataSource::Data(data)])
+                .latency_model(ConstantLatency::new(1, 1))
+                .asset_type(LinearAsset::new(1.0))
+                .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+                .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+                .exchange(ExchangeKind::PartialFillExchange)
+                .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                .build()
+                .unwrap();
+            let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
+            bt.elapse(3).unwrap();
+            if buy {
+                bt.submit_buy_order(0, 1, price, 1.0, TimeInForce::GTX, OrdType::Limit, true)
+                    .unwrap();
+            } else {
+                bt.submit_sell_order(0, 1, price, 1.0, TimeInForce::GTX, OrdType::Limit, true)
+                    .unwrap();
+            }
+            bt.modify(0, 1, price, 0.5, true).unwrap();
+            bt.elapse(20).unwrap();
+            assert_eq!(bt.position(0), 0.0, "a size reduction is not an execution");
+            assert_eq!(bt.state_values(0).balance, 0.0);
+            assert_eq!(bt.state_values(0).num_trades, 0);
+        }
+    }
+}
