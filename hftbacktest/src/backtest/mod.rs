@@ -1324,21 +1324,66 @@ mod test {
 
 #[cfg(test)]
 mod ab3308_maker_terminal {
-    use crate::{backtest::{Backtest,DataSource,ExchangeKind,L2AssetBuilder,assettype::LinearAsset,data::Data,models::{CommonFees,ConstantLatency,PowerProbQueueFunc3,ProbQueueModel,TradingValueFeeModel}},depth::HashMapMarketDepth,prelude::Bot,types::*};
+    use crate::{
+        backtest::{
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
+            assettype::LinearAsset,
+            data::Data,
+            models::{
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
+                TradingValueFeeModel,
+            },
+        },
+        depth::HashMapMarketDepth,
+        prelude::Bot,
+        types::*,
+    };
     #[test]
     fn exactly_exhausted_maker_order_is_not_filled_again_on_either_side() {
-        for buy in [true,false] {
-            let event=|t,ev,px,qty|Event{ev:ev|EXCH_EVENT|LOCAL_EVENT,exch_ts:t,local_ts:t,px,qty,order_id:0,ival:0,fval:0.0};
-            let price=if buy{99.0}else{101.0};
-            let trade=TRADE_EVENT|if buy{SELL_EVENT}else{BUY_EVENT};
-            let data=Data::from_data(&[event(1,DEPTH_EVENT|BUY_EVENT,99.0,1.0),event(2,DEPTH_EVENT|SELL_EVENT,101.0,1.0),event(3,0,0.0,0.0),event(10,trade,price,2.0),event(11,trade,price,1.0),event(20,0,0.0,0.0)]);
-            let asset=L2AssetBuilder::default().data(vec![DataSource::Data(data)]).latency_model(ConstantLatency::new(0,0)).asset_type(LinearAsset::new(1.0)).fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004,0.00028))).queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0))).exchange(ExchangeKind::PartialFillExchange).depth(||HashMapMarketDepth::new(1.0,1.0)).build().unwrap();
-            let mut bt=Backtest::builder().add_asset(asset).build().unwrap();
+        for buy in [true, false] {
+            let event = |t, ev, px, qty| Event {
+                ev: ev | EXCH_EVENT | LOCAL_EVENT,
+                exch_ts: t,
+                local_ts: t,
+                px,
+                qty,
+                order_id: 0,
+                ival: 0,
+                fval: 0.0,
+            };
+            let price = if buy { 99.0 } else { 101.0 };
+            let trade = TRADE_EVENT | if buy { SELL_EVENT } else { BUY_EVENT };
+            let data = Data::from_data(&[
+                event(1, DEPTH_EVENT | BUY_EVENT, 99.0, 1.0),
+                event(2, DEPTH_EVENT | SELL_EVENT, 101.0, 1.0),
+                event(3, 0, 0.0, 0.0),
+                event(10, trade, price, 2.0),
+                event(11, trade, price, 1.0),
+                event(20, 0, 0.0, 0.0),
+            ]);
+            let asset = L2AssetBuilder::default()
+                .data(vec![DataSource::Data(data)])
+                .latency_model(ConstantLatency::new(0, 0))
+                .asset_type(LinearAsset::new(1.0))
+                .fee_model(TradingValueFeeModel::new(CommonFees::new(0.00004, 0.00028)))
+                .queue_model(ProbQueueModel::new(PowerProbQueueFunc3::new(3.0)))
+                .exchange(ExchangeKind::PartialFillExchange)
+                .depth(|| HashMapMarketDepth::new(1.0, 1.0))
+                .build()
+                .unwrap();
+            let mut bt = Backtest::builder().add_asset(asset).build().unwrap();
             bt.elapse(3).unwrap();
-            if buy {bt.submit_buy_order(0,1,price,1.0,TimeInForce::GTX,OrdType::Limit,false).unwrap();} else {bt.submit_sell_order(0,1,price,1.0,TimeInForce::GTX,OrdType::Limit,false).unwrap();}
-            bt.elapse(20).expect("AB3308 later trade cannot refill a fully executed maker order");
-            assert_eq!(bt.position(0),if buy{1.0}else{-1.0});
-            assert!((bt.state_values(0).fee-price*0.00004).abs()<1e-12);
+            if buy {
+                bt.submit_buy_order(0, 1, price, 1.0, TimeInForce::GTX, OrdType::Limit, false)
+                    .unwrap();
+            } else {
+                bt.submit_sell_order(0, 1, price, 1.0, TimeInForce::GTX, OrdType::Limit, false)
+                    .unwrap();
+            }
+            bt.elapse(20)
+                .expect("AB3308 later trade cannot refill a fully executed maker order");
+            assert_eq!(bt.position(0), if buy { 1.0 } else { -1.0 });
+            assert!((bt.state_values(0).fee - price * 0.00004).abs() < 1e-12);
         }
     }
 }
@@ -1347,17 +1392,11 @@ mod ab3308_maker_terminal {
 mod ab3465_modify_is_not_an_execution {
     use crate::{
         backtest::{
-            Backtest,
-            DataSource,
-            ExchangeKind,
-            L2AssetBuilder,
+            Backtest, DataSource, ExchangeKind, L2AssetBuilder,
             assettype::LinearAsset,
             data::Data,
             models::{
-                CommonFees,
-                ConstantLatency,
-                PowerProbQueueFunc3,
-                ProbQueueModel,
+                CommonFees, ConstantLatency, PowerProbQueueFunc3, ProbQueueModel,
                 TradingValueFeeModel,
             },
         },
